@@ -1,0 +1,246 @@
+name: RapidRAW - Android preset fix (test APK)
+
+# In deinem GitHub-Fork unter .github/workflows/rapidraw-presets-test-apk.yml ablegen.
+# Wird automatisch beim Anlegen dieser Datei gestartet; danach manuell unter Actions.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/rapidraw-presets-test-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CI: 'true'
+      NDK_VERSION: '27.2.12479018'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Source aus eigenem RapidRAW-Fork auschecken
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Android-Preset-Fix auf den aktuellen Quellstand anwenden
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rapidraw-preset-import.patch" <<'END_RAPIDRAW_PATCH'
+          --- a/src/components/panel/right/PresetsPanel.tsx
+          +++ b/src/components/panel/right/PresetsPanel.tsx
+          @@ -1,6 +1,7 @@
+           import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+           import { invoke } from '@tauri-apps/api/core';
+          -import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
+          +import { open as openDialog, save as saveDialog, message as showDialogMessage } from '@tauri-apps/plugin-dialog';
+          +import { platform } from '@tauri-apps/plugin-os';
+           import {
+             DndContext,
+             DragOverlay,
+          @@ -869,7 +870,9 @@
+             const handleImportPresets = async () => {
+               try {
+                 const selectedPath = await openDialog({
+          -        filters: [
+          +        // Android uses MIME types instead of filename-extension filters. Omitting
+          +        // filters allows the document picker to show .rrpreset/.xmp/.lrtemplate.
+          +        filters: platform() === 'android' ? undefined : [
+                     { name: t('editor.presets.dialog.allPresetFiles'), extensions: ['rrpreset', 'xmp', 'lrtemplate'] },
+                     { name: t('editor.presets.dialog.rapidRawPreset'), extensions: ['rrpreset'] },
+                     { name: t('editor.presets.dialog.legacyPreset'), extensions: ['xmp', 'lrtemplate'] },
+          @@ -879,8 +882,12 @@
+                 });
+           
+                 if (typeof selectedPath === 'string') {
+          -        const isLegacy =
+          -          selectedPath.toLowerCase().endsWith('.xmp') || selectedPath.toLowerCase().endsWith('.lrtemplate');
+          +        // Android's document picker can return a content:// URI with no extension.
+          +        // Query the display name before deciding which preset parser to use.
+          +        const fileName = selectedPath.startsWith('content://')
+          +          ? await invoke<string>('resolve_android_content_uri_name', { uriStr: selectedPath })
+          +          : selectedPath;
+          +        const isLegacy = fileName.toLowerCase().endsWith('.xmp') || fileName.toLowerCase().endsWith('.lrtemplate');
+           
+                   if (isLegacy) {
+                     await importLegacyPresetsFromFile(selectedPath);
+          @@ -892,5 +899,9 @@
+                 }
+               } catch (error) {
+                 console.error('Failed to import presets:', error);
+          +      await showDialogMessage(String(error), {
+          +        title: t('editor.presets.dialog.importPresetsTitle'),
+          +        kind: 'error',
+          +      });
+               }
+             };
+          --- a/src-tauri/src/file_management.rs
+          +++ b/src-tauri/src/file_management.rs
+          @@ -4,13 +4,66 @@
+           
+               Ok(library_root.to_string_lossy().to_string())
+           }
+          +// The Android document picker returns content:// URIs, not necessarily file paths.
+          +// Reuse the same ContentResolver bridge as the Android image importer.
+          +fn read_preset_import_content(file_path: &str) -> Result<String, String> {
+          +    #[cfg(target_os = "android")]
+          +    if is_android_content_uri(file_path) {
+          +        let bytes = read_android_content_uri(file_path)?;
+          +        return String::from_utf8(bytes)
+          +            .map_err(|e| format!("Preset file is not valid UTF-8: {e}"));
+          +    }
+          +
+          +    fs::read_to_string(file_path).map_err(|e| e.to_string())
+          +}
+          +
+          +fn preset_import_file_name(file_path: &str) -> Result<String, String> {
+          +    #[cfg(target_os = "android")]
+          +    if is_android_content_uri(file_path) {
+          +        return resolve_android_content_uri_name(file_path);
+          +    }
+          +
+          +    Ok(file_path.to_string())
+          +}
+          +
+          +#[cfg(test)]
+          +mod preset_import_tests {
+          +    use super::{preset_import_file_name, read_preset_import_content};
+          +    use std::{
+          +        fs,
+          +        time::{SystemTime, UNIX_EPOCH},
+          +    };
+          +
+          +    #[test]
+          +    fn reads_utf8_preset_from_regular_file() {
+          +        let unique = SystemTime::now()
+          +            .duration_since(UNIX_EPOCH)
+          +            .unwrap()
+          +            .as_nanos();
+          +        let path = std::env::temp_dir().join(format!(
+          +            "rapidraw-preset-{}-{unique}.rrpreset",
+          +            std::process::id()
+          +        ));
+          +        fs::write(&path, "{\"presets\":[]}").unwrap();
+          +        let result = read_preset_import_content(path.to_str().unwrap());
+          +        fs::remove_file(&path).unwrap();
+          +        assert_eq!(result.unwrap(), "{\"presets\":[]}");
+          +    }
+          +
+          +    #[test]
+          +    fn filename_fallback_preserves_regular_file_paths() {
+          +        let name = "/tmp/My Preset.LRTEMPLATE";
+          +        assert_eq!(preset_import_file_name(name).unwrap(), name);
+          +    }
+          +}
+          +
+           #[tauri::command]
+           pub fn handle_import_presets_from_file(
+               file_path: String,
+               app_handle: AppHandle,
+           ) -> Result<Vec<PresetItem>, String> {
+          -    let content =
+          -        fs::read_to_string(file_path).map_err(|e| format!("Failed to read preset file: {}", e))?;
+          +    let content = read_preset_import_content(&file_path)
+          +        .map_err(|e| format!("Failed to read preset file: {}", e))?;
+               let imported_preset_file: PresetFile = serde_json::from_str(&content)
+                   .map_err(|e| format!("Failed to parse preset file: {}", e))?;
+           
+          @@ -60,7 +113,8 @@
+               file_path: String,
+               app_handle: AppHandle,
+           ) -> Result<Vec<PresetItem>, String> {
+          -    let content = fs::read_to_string(&file_path)
+          +    let content = read_preset_import_content(&file_path)
+                   .map_err(|e| format!("Failed to read legacy preset file: {}", e))?;
+          -    let xmp_content = if file_path.to_lowercase().ends_with(".lrtemplate") {
+          +    let file_name = preset_import_file_name(&file_path)?;
+          +    let xmp_content = if file_name.to_lowercase().ends_with(".lrtemplate") {
+                   let re = Regex::new(r#"(?s)s.xmp = "(.*)""#).unwrap();
+          END_RAPIDRAW_PATCH
+          if ! git apply --check "$RUNNER_TEMP/rapidraw-preset-import.patch"; then
+            echo '::error::Der Patch passt nicht auf diesen Commit von RapidRAW. Eine APK ohne Fix wird NICHT gebaut.'
+            echo 'Für die Anpassung diese Ausgabe samt folgenden Treffern teilen:'
+            grep -nE 'handleImportPresets|handle_import_presets_from_file|handle_import_legacy_presets_from_file|read_android_content_uri' \
+              src/components/panel/right/PresetsPanel.tsx src-tauri/src/file_management.rs || true
+            exit 1
+          fi
+          git apply "$RUNNER_TEMP/rapidraw-preset-import.patch"
+          git diff --check
+          if ! grep -q 'read_preset_import_content' src-tauri/src/file_management.rs; then
+            echo '::error::Rust-Fix nicht gefunden'; exit 1
+          fi
+          if ! grep -q 'resolve_android_content_uri_name' src/components/panel/right/PresetsPanel.tsx; then
+            echo '::error::Dateinamen-Fix nicht gefunden'; exit 1
+          fi
+          echo 'Android-Preset-Fix ist im ausgecheckten Quellstand aktiv.'
+
+      - name: Node.js 22 einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Rust für ARM64 Android einrichten
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: rustfmt
+
+      - name: Android SDK bereitstellen
+        uses: android-actions/setup-android@v3
+
+      - name: Android NDK installieren und konfigurieren
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;${NDK_VERSION}" 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          echo "NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> "$GITHUB_ENV"
+          echo "NDK_PATH=${NDK_PATH}" >> "$GITHUB_ENV"
+
+      - name: Frontend-Abhängigkeiten installieren
+        run: npm ci --no-audit --no-fund
+
+      - name: Android-Projekt initialisieren, falls nicht vorhanden
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f src-tauri/gen/android/gradlew ]]; then
+            npm run tauri android init -- --ci
+          fi
+
+      - name: Android Test-APK bauen (Debug-Signatur, ARM64)
+        run: npm run tauri android build -- --apk --debug --target aarch64 --ci
+
+      - name: APK auf Existenz und Signatur prüfen
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR=src-tauri/gen/android/app/build/outputs/apk
+          mapfile -d '' APK_FILES < <(find "$APK_DIR" -type f -name '*.apk' -print0)
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo '::error::Der Build hat keine APK erzeugt.'; exit 1
+          fi
+          for apk in "${APK_FILES[@]}"; do
+            echo "APK: $apk"
+            sha256sum "$apk"
+            "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify "$apk"
+          done
+
+      - name: Fertige APK zum Herunterladen bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: RapidRAW-PresetFix-Android-ARM64-Debug
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
